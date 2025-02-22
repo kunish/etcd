@@ -17,14 +17,17 @@ package v3rpc
 import (
 	"context"
 	"crypto/sha256"
+	errorspkg "errors"
 	"io"
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"go.uber.org/zap"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"go.etcd.io/etcd/api/v3/version"
+	"go.etcd.io/etcd/server/v3/config"
 	"go.etcd.io/etcd/server/v3/etcdserver"
 	"go.etcd.io/etcd/server/v3/etcdserver/apply"
 	"go.etcd.io/etcd/server/v3/etcdserver/errors"
@@ -33,8 +36,6 @@ import (
 	"go.etcd.io/etcd/server/v3/storage/mvcc"
 	"go.etcd.io/etcd/server/v3/storage/schema"
 	"go.etcd.io/raft/v3"
-
-	"go.uber.org/zap"
 )
 
 type KVGetter interface {
@@ -64,6 +65,10 @@ type ClusterStatusGetter interface {
 	IsLearner() bool
 }
 
+type ConfigGetter interface {
+	Config() config.ServerConfig
+}
+
 type maintenanceServer struct {
 	lg     *zap.Logger
 	rg     apply.RaftStatusGetter
@@ -75,10 +80,26 @@ type maintenanceServer struct {
 	cs     ClusterStatusGetter
 	d      Downgrader
 	vs     serverversion.Server
+	cg     ConfigGetter
+
+	healthNotifier notifier
 }
 
-func NewMaintenanceServer(s *etcdserver.EtcdServer) pb.MaintenanceServer {
-	srv := &maintenanceServer{lg: s.Cfg.Logger, rg: s, hasher: s.KV().HashStorage(), bg: s, a: s, lt: s, hdr: newHeader(s), cs: s, d: s, vs: etcdserver.NewServerVersionAdapter(s)}
+func NewMaintenanceServer(s *etcdserver.EtcdServer, healthNotifier notifier) pb.MaintenanceServer {
+	srv := &maintenanceServer{
+		lg:             s.Cfg.Logger,
+		rg:             s,
+		hasher:         s.KV().HashStorage(),
+		bg:             s,
+		a:              s,
+		lt:             s,
+		hdr:            newHeader(s),
+		cs:             s,
+		d:              s,
+		vs:             etcdserver.NewServerVersionAdapter(s),
+		healthNotifier: healthNotifier,
+		cg:             s,
+	}
 	if srv.lg == nil {
 		srv.lg = zap.NewNop()
 	}
@@ -87,10 +108,12 @@ func NewMaintenanceServer(s *etcdserver.EtcdServer) pb.MaintenanceServer {
 
 func (ms *maintenanceServer) Defragment(ctx context.Context, sr *pb.DefragmentRequest) (*pb.DefragmentResponse, error) {
 	ms.lg.Info("starting defragment")
+	ms.healthNotifier.defragStarted()
+	defer ms.healthNotifier.defragFinished()
 	err := ms.bg.Backend().Defrag()
 	if err != nil {
 		ms.lg.Warn("failed to defragment", zap.Error(err))
-		return nil, err
+		return nil, togRPCError(err)
 	}
 	ms.lg.Info("finished defragment")
 	return &pb.DefragmentResponse{}, nil
@@ -141,7 +164,7 @@ func (ms *maintenanceServer) Snapshot(sr *pb.SnapshotRequest, srv pb.Maintenance
 		buf := make([]byte, snapshotSendBufferSize)
 
 		n, err := io.ReadFull(pr, buf)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		if err != nil && !errorspkg.Is(err, io.EOF) && !errorspkg.Is(err, io.ErrUnexpectedEOF) {
 			return togRPCError(err)
 		}
 		sent += int64(n)
@@ -238,9 +261,17 @@ func (ms *maintenanceServer) Status(ctx context.Context, ar *pb.StatusRequest) (
 		DbSize:           ms.bg.Backend().Size(),
 		DbSizeInUse:      ms.bg.Backend().SizeInUse(),
 		IsLearner:        ms.cs.IsLearner(),
+		DbSizeQuota:      ms.cg.Config().QuotaBackendBytes,
+		DowngradeInfo:    &pb.DowngradeInfo{Enabled: false},
 	}
 	if storageVersion := ms.vs.GetStorageVersion(); storageVersion != nil {
 		resp.StorageVersion = storageVersion.String()
+	}
+	if downgradeInfo := ms.vs.GetDowngradeInfo(); downgradeInfo != nil {
+		resp.DowngradeInfo = &pb.DowngradeInfo{
+			Enabled:       downgradeInfo.Enabled,
+			TargetVersion: downgradeInfo.TargetVersion,
+		}
 	}
 	if resp.Leader == raft.None {
 		resp.Errors = append(resp.Errors, errors.ErrNoLeader.Error())
@@ -252,7 +283,7 @@ func (ms *maintenanceServer) Status(ctx context.Context, ar *pb.StatusRequest) (
 }
 
 func (ms *maintenanceServer) MoveLeader(ctx context.Context, tr *pb.MoveLeaderRequest) (*pb.MoveLeaderResponse, error) {
-	if ms.rg.MemberId() != ms.rg.Leader() {
+	if ms.rg.MemberID() != ms.rg.Leader() {
 		return nil, rpctypes.ErrGRPCNotLeader
 	}
 
@@ -279,7 +310,7 @@ type authMaintenanceServer struct {
 
 func (ams *authMaintenanceServer) Defragment(ctx context.Context, sr *pb.DefragmentRequest) (*pb.DefragmentResponse, error) {
 	if err := ams.isPermitted(ctx); err != nil {
-		return nil, err
+		return nil, togRPCError(err)
 	}
 
 	return ams.maintenanceServer.Defragment(ctx, sr)
@@ -287,7 +318,7 @@ func (ams *authMaintenanceServer) Defragment(ctx context.Context, sr *pb.Defragm
 
 func (ams *authMaintenanceServer) Snapshot(sr *pb.SnapshotRequest, srv pb.Maintenance_SnapshotServer) error {
 	if err := ams.isPermitted(srv.Context()); err != nil {
-		return err
+		return togRPCError(err)
 	}
 
 	return ams.maintenanceServer.Snapshot(sr, srv)
@@ -295,7 +326,7 @@ func (ams *authMaintenanceServer) Snapshot(sr *pb.SnapshotRequest, srv pb.Mainte
 
 func (ams *authMaintenanceServer) Hash(ctx context.Context, r *pb.HashRequest) (*pb.HashResponse, error) {
 	if err := ams.isPermitted(ctx); err != nil {
-		return nil, err
+		return nil, togRPCError(err)
 	}
 
 	return ams.maintenanceServer.Hash(ctx, r)
@@ -303,14 +334,14 @@ func (ams *authMaintenanceServer) Hash(ctx context.Context, r *pb.HashRequest) (
 
 func (ams *authMaintenanceServer) HashKV(ctx context.Context, r *pb.HashKVRequest) (*pb.HashKVResponse, error) {
 	if err := ams.isPermitted(ctx); err != nil {
-		return nil, err
+		return nil, togRPCError(err)
 	}
 	return ams.maintenanceServer.HashKV(ctx, r)
 }
 
 func (ams *authMaintenanceServer) Status(ctx context.Context, ar *pb.StatusRequest) (*pb.StatusResponse, error) {
 	if err := ams.isPermitted(ctx); err != nil {
-		return nil, err
+		return nil, togRPCError(err)
 	}
 
 	return ams.maintenanceServer.Status(ctx, ar)
@@ -318,7 +349,7 @@ func (ams *authMaintenanceServer) Status(ctx context.Context, ar *pb.StatusReque
 
 func (ams *authMaintenanceServer) MoveLeader(ctx context.Context, tr *pb.MoveLeaderRequest) (*pb.MoveLeaderResponse, error) {
 	if err := ams.isPermitted(ctx); err != nil {
-		return nil, err
+		return nil, togRPCError(err)
 	}
 
 	return ams.maintenanceServer.MoveLeader(ctx, tr)
@@ -326,7 +357,7 @@ func (ams *authMaintenanceServer) MoveLeader(ctx context.Context, tr *pb.MoveLea
 
 func (ams *authMaintenanceServer) Downgrade(ctx context.Context, r *pb.DowngradeRequest) (*pb.DowngradeResponse, error) {
 	if err := ams.isPermitted(ctx); err != nil {
-		return nil, err
+		return nil, togRPCError(err)
 	}
 
 	return ams.maintenanceServer.Downgrade(ctx, r)
