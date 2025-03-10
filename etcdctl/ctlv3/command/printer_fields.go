@@ -203,6 +203,8 @@ func (p *fieldsPrinter) EndpointStatus(eps []epStatus) {
 		fmt.Println(`"RaftAppliedIndex" :`, ep.Resp.RaftAppliedIndex)
 		fmt.Println(`"Errors" :`, ep.Resp.Errors)
 		fmt.Printf("\"Endpoint\" : %q\n", ep.Ep)
+		fmt.Printf("\"DowngradeTargetVersion\" : %q\n", ep.Resp.DowngradeInfo.GetTargetVersion())
+		fmt.Println(`"DowngradeEnabled" :`, ep.Resp.DowngradeInfo.GetEnabled())
 		fmt.Println()
 	}
 }
@@ -248,9 +250,11 @@ func (p *fieldsPrinter) RoleList(r v3.AuthRoleListResponse) {
 	}
 	fmt.Println()
 }
+
 func (p *fieldsPrinter) RoleGrantPermission(role string, r v3.AuthRoleGrantPermissionResponse) {
 	p.hdr(r.Header)
 }
+
 func (p *fieldsPrinter) RoleRevokePermission(role string, key string, end string, r v3.AuthRoleRevokePermissionResponse) {
 	p.hdr(r.Header)
 }
@@ -259,6 +263,7 @@ func (p *fieldsPrinter) UserChangePassword(r v3.AuthUserChangePasswordResponse) 
 func (p *fieldsPrinter) UserGrantRole(user string, role string, r v3.AuthUserGrantRoleResponse) {
 	p.hdr(r.Header)
 }
+
 func (p *fieldsPrinter) UserRevokeRole(user string, role string, r v3.AuthUserRevokeRoleResponse) {
 	p.hdr(r.Header)
 }

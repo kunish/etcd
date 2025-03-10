@@ -19,7 +19,8 @@ import (
 	"net"
 	"net/http"
 	"testing"
-	"time"
+
+	"github.com/stretchr/testify/require"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/server/v3/etcdserver"
@@ -36,9 +37,7 @@ func TestCompactionHash(t *testing.T) {
 	defer clus.Terminate(t)
 
 	cc, err := clus.ClusterClient(t)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
@@ -47,13 +46,14 @@ func TestCompactionHash(t *testing.T) {
 		},
 	}
 
-	testutil.TestCompactionHash(context.Background(), t, hashTestCase{cc, clus.Members[0].GRPCURL(), client}, 1000)
+	testutil.TestCompactionHash(context.Background(), t, hashTestCase{cc, clus.Members[0].GRPCURL, client, clus.Members[0].Server}, 1000)
 }
 
 type hashTestCase struct {
 	*clientv3.Client
-	url  string
-	http *http.Client
+	url    string
+	http   *http.Client
+	server *etcdserver.EtcdServer
 }
 
 func (tc hashTestCase) Put(ctx context.Context, key, value string) error {
@@ -67,7 +67,7 @@ func (tc hashTestCase) Delete(ctx context.Context, key string) error {
 }
 
 func (tc hashTestCase) HashByRev(ctx context.Context, rev int64) (testutil.KeyValueHash, error) {
-	resp, err := etcdserver.HashByRev(ctx, tc.http, "http://unix", rev)
+	resp, err := etcdserver.HashByRev(ctx, tc.server.Cluster().ID(), tc.http, "http://unix", rev)
 	return testutil.KeyValueHash{Hash: resp.Hash, CompactRevision: resp.CompactRevision, Revision: resp.Header.Revision}, err
 }
 
@@ -77,8 +77,6 @@ func (tc hashTestCase) Defrag(ctx context.Context) error {
 }
 
 func (tc hashTestCase) Compact(ctx context.Context, rev int64) error {
-	_, err := tc.Client.Compact(ctx, rev)
-	// Wait for compaction to be compacted
-	time.Sleep(50 * time.Millisecond)
+	_, err := tc.Client.Compact(ctx, rev, clientv3.WithCompactPhysical())
 	return err
 }
